@@ -1,4 +1,4 @@
-name: Build VSCodium Windows x64 AVX2 LTO
+name: Build VSCodium Windows x64 optimized safe
 
 on:
   workflow_dispatch:
@@ -21,11 +21,8 @@ jobs:
       VSCODE_QUALITY: stable
       GYP_MSVS_VERSION: '2022'
       MAX_OLD_SPACE_SIZE: '8192'
-      # MSVC native modules built from source: speed, AVX2 and whole-program optimization.
-      # CL and LINK are consumed by MSVC tools, not prebuilt Electron binaries.
-      # Caution: third-party native projects may reject /GL or /LTCG.
-      CL: '/O2 /arch:AVX2 /GL'
-      LINK: '/LTCG'
+      # Do not inject CL or LINK globally: node-gyp/MSBuild native add-ons
+      # can misinterpret the flags and fail with LNK1181 or D9002.
       # Rust source-built release targets: AVX2 + fat link-time optimization.
       # Cargo release profile applies only to crates built under that profile.
       RUSTFLAGS: '-C target-feature=+avx2'
@@ -71,15 +68,14 @@ jobs:
       - name: Display native optimization configuration
         shell: pwsh
         run: |
-          Write-Host "MSVC CL flags: $env:CL"
-          Write-Host "MSVC linker flags: $env:LINK"
+          Write-Host 'MSVC CL/LINK: not overridden; upstream node-gyp defaults retained.'
           Write-Host "Rust compiler flags: $env:RUSTFLAGS"
           Write-Host "Rust release optimization: $env:CARGO_PROFILE_RELEASE_OPT_LEVEL"
           Write-Host "Rust release LTO: $env:CARGO_PROFILE_RELEASE_LTO"
           Write-Host "Rust release codegen units: $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
           Write-Host 'Optimization applies only to native code compiled from source.'
           Write-Host 'Electron and other prebuilt binaries are not rebuilt.'
-          Write-Host 'MSVC /GL+/LTCG may be incompatible with some third-party native add-ons.'
+          Write-Host 'MSVC global LTO disabled to avoid failures in native Node add-ons.'
 
       - name: Prepare VS Code source and build VSCodium
         shell: bash
@@ -90,6 +86,8 @@ jobs:
           # get_repo.sh fetches the matching Microsoft VS Code source into ./vscode.
           # build.sh applies VSCodium patches, installs npm dependencies,
           # compiles, and packages the Windows x64 desktop application.
+          # Explicitly clear inherited compiler overrides for native Node modules.
+          unset CL LINK _CL_ _LINK_
           source ./get_repo.sh
           source ./build.sh
 
@@ -119,7 +117,7 @@ jobs:
       - name: Upload Windows x64 application
         uses: actions/upload-artifact@v4
         with:
-          name: VSCodium-Windows-x64-AVX2-LTO
+          name: VSCodium-Windows-x64-Optimized-Safe
           path: ${{ steps.package.outputs.path }}/
           if-no-files-found: error
           retention-days: 14
