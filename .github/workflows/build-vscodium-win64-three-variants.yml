@@ -1,4 +1,4 @@
-name: Build VSCodium Windows x64 AVX2 GL LTCG variants
+name: Build VSCodium Windows x64 selective GL LTCG variants
 
 on:
   workflow_dispatch:
@@ -34,8 +34,8 @@ jobs:
       VSCODE_QUALITY: stable
       GYP_MSVS_VERSION: '2022'
       MAX_OLD_SPACE_SIZE: '8192'
-      # CL and _LINK_ are set per matrix variant after environment setup.
-      # Avoid setting LINK: some node-gyp packages interpret it as a tool/path.
+      # Global /GL and /LTCG are intentionally disabled.
+      CL: "/O2 /arch:AVX2"
       # Rust source-built release targets: AVX2 + fat link-time optimization.
       # Cargo release profile applies only to crates built under that profile.
       RUSTFLAGS: '-C target-feature=+avx2'
@@ -78,58 +78,80 @@ jobs:
           cargo --version
           git --version
 
-      - name: Configure MSVC optimization variant
+      # First complete upstream preparation with the proven MSVC settings.
+      # In particular, do NOT put /GL or /LTCG into the global CL/LINK/_LINK_ variables.
+      - name: Retrieve and prepare VS Code with baseline compiler flags
+        shell: bash
+        run: |
+          set -eo pipefail
+          unset LINK _CL_ _LINK_
+          export CL='/O2 /arch:AVX2'
+          source ./get_repo.sh
+          source ./version.sh
+          source ./prepare_vscode.sh
+
+      # A controlled target-specific experiment: recompile exactly one C++ addon
+      # with variant-specific GYP/MSVC settings after npm ci has completed.
+      # This is NOT whole-application MSVC LTO. Most native binaries still use
+      # upstream settings. It deliberately avoids modifying the Rust CLI link.
+      - name: Configure selected native target (@vscode/deviceid)
         shell: pwsh
         env:
           USE_GL: ${{ matrix.msvc_gl }}
           USE_LTCG: ${{ matrix.msvc_ltcg }}
         run: |
-          $clFlags = '/O2 /arch:AVX2'
-          if ($env:USE_GL -eq 'yes') { $clFlags += ' /GL' }
-          "CL=$clFlags" >> $env:GITHUB_ENV
-          # _LINK_ is an MSVC linker-options variable, unlike the frequently
-          # overloaded LINK variable that interfered with the earlier build.
-          if ($env:USE_LTCG -eq 'yes') {
-            '_LINK_=/LTCG' >> $env:GITHUB_ENV
-          } else {
-            '_LINK_=' >> $env:GITHUB_ENV
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:GITHUB_WORKSPACE 'vscode/node_modules/@vscode/deviceid/binding.gyp'
+          if (-not (Test-Path $file)) { throw "Expected addon binding.gyp missing: $file" }
+          $source = [System.IO.File]::ReadAllText($file)
+          if ($env:USE_GL -eq 'yes') {
+            $pattern = '"VCCLCompilerTool"\s*:\s*\{'
+            if (-not [regex]::IsMatch($source, $pattern)) { throw 'VCCLCompilerTool block not found' }
+            $source = ([regex]::new($pattern)).Replace($source, '"VCCLCompilerTool": { "WholeProgramOptimization": "true", ', 1)
           }
-          'LINK=' >> $env:GITHUB_ENV
-          Write-Host "MSVC CL=$clFlags"
-          Write-Host "Explicit /LTCG: $env:USE_LTCG"
-          Write-Host 'Note: /GL implicitly enables LTCG even without explicit /LTCG.'
+          if ($env:USE_LTCG -eq 'yes') {
+            $pattern = '"VCLinkerTool"\s*:\s*\{'
+            if (-not [regex]::IsMatch($source, $pattern)) { throw 'VCLinkerTool block not found' }
+            $source = ([regex]::new($pattern)).Replace($source, '"VCLinkerTool": { "LinkTimeCodeGeneration": "UseLinkTimeCodeGeneration", ', 1)
+          }
+          [System.IO.File]::WriteAllText($file, $source, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Patched selected native addon for ${{ matrix.variant }}"
+          Select-String -Path $file -Pattern 'WholeProgramOptimization|LinkTimeCodeGeneration' | ForEach-Object { Write-Host $_.Line }
 
-      - name: Display native optimization configuration
+      - name: Rebuild selected native addon only
         shell: pwsh
+        working-directory: vscode
         run: |
-          Write-Host "Variant: ${{ matrix.variant }}"
-          Write-Host "MSVC compiler CL: $env:CL"
-          Write-Host "MSVC linker _LINK_: $env:_LINK_"
-          Write-Host "Rust compiler flags: $env:RUSTFLAGS"
-          Write-Host "Rust release optimization: $env:CARGO_PROFILE_RELEASE_OPT_LEVEL"
-          Write-Host "Rust release LTO: $env:CARGO_PROFILE_RELEASE_LTO"
-          Write-Host "Rust release codegen units: $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
-          Write-Host 'Only modules compiled from source receive native compiler options.'
-          Write-Host 'Prebuilt Electron remains unchanged; AVX2-capable CPU required.'
+          $ErrorActionPreference = 'Stop'
+          # Keep proven AVX2 compiler defaults. Optimizations are in the
+          # addon's binding.gyp, never in global /GL or linker environment.
+          $env:CL = '/O2 /arch:AVX2'
+          Remove-Item Env:LINK -ErrorAction SilentlyContinue
+          Remove-Item Env:_LINK_ -ErrorAction SilentlyContinue
+          Remove-Item Env:_CL_ -ErrorAction SilentlyContinue
+          npm rebuild '@vscode/deviceid' --build-from-source
+          if ($LASTEXITCODE -ne 0) { throw 'Targeted deviceid rebuild failed' }
 
-      - name: Prepare VS Code source and build VSCodium
+      # Matches upstream build.sh's Windows CI_BUILD=no packaging path,
+      # deliberately skipping prepare_vscode.sh a second time. The latter
+      # would run npm ci again and erase the targeted native rebuild.
+      - name: Package VSCodium from already prepared source
         shell: bash
         run: |
           set -eo pipefail
-          # Upstream VSCodium scripts intentionally read unset optional variables.
-          # Do not enable bash nounset (-u).
-          # get_repo.sh fetches the matching Microsoft VS Code source into ./vscode.
-          # build.sh applies VSCodium patches, installs npm dependencies,
-          # compiles, and packages the Windows x64 desktop application.
-          # Retain per-variant CL and _LINK_ settings. Clear only the problematic
-          # LINK variable; do not erase _LINK_ (the chosen LTCG setting).
-          unset LINK _CL_
-          echo "MSVC CL=$CL"
-          echo "MSVC _LINK_=${_LINK_:-<unset>}"
-          # Note: globally enabling /GL may conflict with certain third-party
-          # node-gyp projects; /GL also implicitly enables LTCG at link time.
-          source ./get_repo.sh
-          source ./build.sh
+          unset LINK _CL_ _LINK_
+          export CL='/O2 /arch:AVX2'
+          export NODE_OPTIONS="--max-old-space-size=${MAX_OLD_SPACE_SIZE}"
+          export VSCODE_PUBLISH_COUNTER=1
+          cd vscode
+          npm run gulp vscode-min-prepack
+          source ../build/windows/rtf/make.sh
+          source ../build/windows/install_inno_update.sh
+          npm run copy-policy-dto --prefix build
+          node build/lib/policies/policyGenerator.ts build/lib/policies/policyData.jsonc win32
+          npm run gulp "vscode-win32-${VSCODE_ARCH}-min-packing"
+          # Rust code-cli builds without any global MSVC linker overrides.
+          source ../build_cli.sh
 
       - name: Locate packaged VSCodium application
         id: package
@@ -157,7 +179,7 @@ jobs:
       - name: Upload Windows x64 application
         uses: actions/upload-artifact@v4
         with:
-          name: VSCodium-Windows-x64-AVX2-${{ matrix.variant }}
+          name: VSCodium-Windows-x64-AVX2-Selective-${{ matrix.variant }}
           path: ${{ steps.package.outputs.path }}/
           if-no-files-found: error
           retention-days: 14
