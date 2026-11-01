@@ -1,0 +1,118 @@
+name: Build Code OSS Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 packaged application
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      VSCODE_QUALITY: oss
+      npm_config_arch: x64
+      GYP_MSVS_VERSION: '2022'
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js from .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up Python for node-gyp
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python setuptools
+        shell: pwsh
+        run: python -m pip install --upgrade setuptools
+
+      - name: Install dependencies
+        shell: pwsh
+        run: npm install
+
+      # The OSS package may omit the built-in Copilot extension. Upstream's
+      # packaging currently assumes its SDK exists and otherwise fails.
+      - name: Allow missing Copilot SDK in OSS packaging
+        shell: pwsh
+        run: |
+          $file = 'build/gulpfile.vscode.ts'
+          $source = [System.IO.File]::ReadAllText((Resolve-Path $file))
+          $old = 'prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);'
+          if (-not $source.Contains($old)) {
+            throw "Expected Copilot shim call not found in $file; upstream may have changed."
+          }
+          $new = @'
+          if (fs.existsSync(path.join(builtInCopilotExtensionDir, 'node_modules', '@github', 'copilot', 'sdk'))) {
+              prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);
+          } else if (process.env['VSCODE_QUALITY'] === 'oss') {
+              console.log('[Code OSS] Copilot SDK absent; skipping built-in Copilot ripgrep shim.');
+          } else {
+              throw new Error('Built-in Copilot SDK missing from non-OSS build');
+          }
+          '@
+          $source = $source.Replace($old, $new)
+          [System.IO.File]::WriteAllText((Resolve-Path $file), $source, [System.Text.UTF8Encoding]::new($false))
+
+      # VS Code uses signtool to verify/remove existing Authenticode signatures
+      # before rewriting version resources, even for unsigned Code - OSS builds.
+      - name: Locate Windows SDK SignTool
+        shell: pwsh
+        run: |
+          $sdkRoots = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "${env:ProgramFiles}\Windows Kits\10\bin"
+          )
+          $tools = foreach ($root in $sdkRoots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter signtool.exe -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.DirectoryName -match '[\\/]x64$' }
+            }
+          }
+          $tool = $tools | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) {
+            throw 'signtool.exe not found. Install the Windows 10/11 SDK Signing Tools on this runner.'
+          }
+          $toolDir = $tool.DirectoryName
+          Write-Host "Using SignTool: $($tool.FullName)"
+          $toolDir >> $env:GITHUB_PATH
+          & $tool.FullName /?
+
+      - name: Build and package Code OSS
+        shell: pwsh
+        run: npm run gulp -- vscode-win32-x64-min
+
+      - name: Locate packaged application
+        id: package
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE '..\VSCode-win32-x64'),
+            (Join-Path $env:GITHUB_WORKSPACE '.build\win32-x64'),
+            (Join-Path $env:GITHUB_WORKSPACE '.build\win32-x64\archive')
+          )
+          $package = $candidates | Where-Object {
+            (Test-Path $_ -PathType Container) -and
+            (Get-ChildItem $_ -Filter 'Code - OSS.exe' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+          } | Select-Object -First 1
+          if (-not $package) {
+            throw 'Cannot find the packaged Code - OSS.exe. Check the gulp build output and adjust the artifact path.'
+          }
+          $package = (Resolve-Path $package).Path
+          "path=$package" >> $env:GITHUB_OUTPUT
+          Write-Host "Packaged application: $package"
+
+      - name: Upload Windows x64 application
+        uses: actions/upload-artifact@v4
+        with:
+          name: Code-OSS-Windows-x64
+          path: ${{ steps.package.outputs.path }}/
+          if-no-files-found: error
+          retention-days: 14
