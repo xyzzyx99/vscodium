@@ -1,0 +1,163 @@
+name: Build VSCodium Windows x64 AVX2 GL LTCG variants
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 ${{ matrix.variant }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: GL
+            msvc_gl: 'yes'
+            msvc_ltcg: 'no'
+          - variant: LTCG
+            msvc_gl: 'no'
+            msvc_ltcg: 'yes'
+          - variant: GL-LTCG
+            msvc_gl: 'yes'
+            msvc_ltcg: 'yes'
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      SHOULD_BUILD: 'yes'
+      SHOULD_BUILD_REH: 'no'
+      SHOULD_BUILD_REH_WEB: 'no'
+      CI_BUILD: 'no'
+      OS_NAME: windows
+      VSCODE_ARCH: x64
+      VSCODE_QUALITY: stable
+      GYP_MSVS_VERSION: '2022'
+      MAX_OLD_SPACE_SIZE: '8192'
+      # CL and _LINK_ are set per matrix variant after environment setup.
+      # Avoid setting LINK: some node-gyp packages interpret it as a tool/path.
+      # Rust source-built release targets: AVX2 + fat link-time optimization.
+      # Cargo release profile applies only to crates built under that profile.
+      RUSTFLAGS: '-C target-feature=+avx2'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+      CARGO_PROFILE_RELEASE_LTO: 'fat'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+
+    steps:
+      - name: Check out VSCodium sources
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js from VSCodium .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and check tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command jq -ErrorAction SilentlyContinue)) {
+            choco install jq -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to install jq' }
+          }
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            throw 'Rust/Cargo is missing from the Windows runner.'
+          }
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            throw '7-Zip is missing from the Windows runner.'
+          }
+          node --version
+          npm --version
+          python --version
+          jq --version
+          cargo --version
+          git --version
+
+      - name: Configure MSVC optimization variant
+        shell: pwsh
+        env:
+          USE_GL: ${{ matrix.msvc_gl }}
+          USE_LTCG: ${{ matrix.msvc_ltcg }}
+        run: |
+          $clFlags = '/O2 /arch:AVX2'
+          if ($env:USE_GL -eq 'yes') { $clFlags += ' /GL' }
+          "CL=$clFlags" >> $env:GITHUB_ENV
+          # _LINK_ is an MSVC linker-options variable, unlike the frequently
+          # overloaded LINK variable that interfered with the earlier build.
+          if ($env:USE_LTCG -eq 'yes') {
+            '_LINK_=/LTCG' >> $env:GITHUB_ENV
+          } else {
+            '_LINK_=' >> $env:GITHUB_ENV
+          }
+          'LINK=' >> $env:GITHUB_ENV
+          Write-Host "MSVC CL=$clFlags"
+          Write-Host "Explicit /LTCG: $env:USE_LTCG"
+          Write-Host 'Note: /GL implicitly enables LTCG even without explicit /LTCG.'
+
+      - name: Display native optimization configuration
+        shell: pwsh
+        run: |
+          Write-Host "Variant: ${{ matrix.variant }}"
+          Write-Host "MSVC compiler CL: $env:CL"
+          Write-Host "MSVC linker _LINK_: $env:_LINK_"
+          Write-Host "Rust compiler flags: $env:RUSTFLAGS"
+          Write-Host "Rust release optimization: $env:CARGO_PROFILE_RELEASE_OPT_LEVEL"
+          Write-Host "Rust release LTO: $env:CARGO_PROFILE_RELEASE_LTO"
+          Write-Host "Rust release codegen units: $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+          Write-Host 'Only modules compiled from source receive native compiler options.'
+          Write-Host 'Prebuilt Electron remains unchanged; AVX2-capable CPU required.'
+
+      - name: Prepare VS Code source and build VSCodium
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Upstream VSCodium scripts intentionally read unset optional variables.
+          # Do not enable bash nounset (-u).
+          # get_repo.sh fetches the matching Microsoft VS Code source into ./vscode.
+          # build.sh applies VSCodium patches, installs npm dependencies,
+          # compiles, and packages the Windows x64 desktop application.
+          # Retain per-variant CL and _LINK_ settings. Clear only the problematic
+          # LINK variable; do not erase _LINK_ (the chosen LTCG setting).
+          unset LINK _CL_
+          echo "MSVC CL=$CL"
+          echo "MSVC _LINK_=${_LINK_:-<unset>}"
+          # Note: globally enabling /GL may conflict with certain third-party
+          # node-gyp projects; /GL also implicitly enables LTCG at link time.
+          source ./get_repo.sh
+          source ./build.sh
+
+      - name: Locate packaged VSCodium application
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE '..\VSCode-win32-x64'),
+            (Join-Path $env:GITHUB_WORKSPACE 'VSCode-win32-x64')
+          )
+          $package = $candidates | Where-Object {
+            (Test-Path $_ -PathType Container) -and
+            (Test-Path (Join-Path $_ 'VSCodium.exe') -PathType Leaf)
+          } | Select-Object -First 1
+          if (-not $package) {
+            Write-Host 'Potential executables:'
+            Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE '..') -Filter 'VSCodium.exe' -File -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 20 -ExpandProperty FullName
+            throw 'Cannot find packaged VSCodium.exe; inspect the upstream packaging output.'
+          }
+          $package = (Resolve-Path $package).Path
+          "path=$package" >> $env:GITHUB_OUTPUT
+          Write-Host "Packaged application: $package"
+
+      - name: Upload Windows x64 application
+        uses: actions/upload-artifact@v4
+        with:
+          name: VSCodium-Windows-x64-AVX2-${{ matrix.variant }}
+          path: ${{ steps.package.outputs.path }}/
+          if-no-files-found: error
+          retention-days: 14
