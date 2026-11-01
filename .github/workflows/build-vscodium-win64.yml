@@ -60,7 +60,9 @@ jobs:
       - name: Prepare VS Code source and build VSCodium
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
+          # Upstream VSCodium scripts intentionally read unset optional variables.
+          # Do not enable bash nounset (-u).
           # get_repo.sh fetches the matching Microsoft VS Code source into ./vscode.
           # build.sh applies VSCodium patches, installs npm dependencies,
           # compiles, and packages the Windows x64 desktop application.
